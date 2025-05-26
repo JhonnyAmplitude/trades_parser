@@ -1,0 +1,888 @@
+Project Structure:
+./full_statement.py
+./fin_operations.py
+./OperationDTO.py
+./constants.py
+./forex_trades.py
+./stocks_bounds.py
+./utils.py
+./main.py
+
+File Contents:
+full_statement.py:
+```
+# full_statement.py
+
+import json
+from typing import List, Dict, Any
+
+from constants import CURRENCY_DICT
+from fin_operations import parse_financial_operations
+from forex_trades    import parse_forex_trades
+from stocks_bounds   import parse_stock_bond_trades
+
+def normalize_currency(op: Dict[str, Any]) -> None:
+    """
+    Заменяет op['currency'] на нормализованное значение из CURRENCY_DICT,
+    если оно там есть.
+    """
+    cur = op.get("currency", "")
+    op["currency"] = CURRENCY_DICT.get(cur, cur)
+
+def parse_full_statement(file_path: str) -> Dict[str, Any]:
+    """
+    Собирает:
+      1) Финансовые операции по счёту
+      2) Сделки с иностранной валютой
+      3) Сделки с акциями и облигациями
+    Приводит currency через CURRENCY_DICT и возвращает единый словарь
+    с метаданными и отсортированным по дате списком операций.
+    """
+
+    # 1) Финансовые операции по счёту
+    fin = parse_financial_operations(file_path)
+    header_data = {
+        "account_id":         fin.get("account_id"),
+        "account_date_start": fin.get("account_date_start"),
+        "date_start":         fin.get("date_start"),
+        "date_end":           fin.get("date_end"),
+    }
+    fin_ops = fin.get("operations", [])
+
+    # 2) Сделки по иностранной валюте
+    forex_ops = parse_forex_trades(file_path)
+
+    # 3) Сделки с акциями и облигациями
+    stockbond_ops = parse_stock_bond_trades(file_path)
+
+    # 4) Объединяем все операции
+    all_ops: List[Dict[str, Any]] = fin_ops + forex_ops + stockbond_ops
+
+    # 5) Нормализуем currency для каждой операции
+    for op in all_ops:
+        normalize_currency(op)
+
+    # 6) Сортируем по дате
+    all_ops.sort(key=lambda op: op.get("date", ""))
+
+    return {
+        **header_data,
+        "operations": all_ops
+    }
+
+if __name__ == "__main__":
+    import sys
+    path = sys.argv[1] if len(sys.argv) > 1 else "4.xls"
+    result = parse_full_statement(path)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+
+```
+
+fin_operations.py:
+```
+import json
+
+import pandas as pd
+import re
+from OperationDTO import OperationDTO
+from constants import (
+    CURRENCY_DICT,
+    OPERATION_TYPE_MAP,
+    SKIP_OPERATIONS,
+    SPECIAL_OPERATION_HANDLERS,
+    VALID_OPERATIONS,
+)
+from utils import parse_date, parse_header_data, is_nonzero
+
+def extract_isin(comment) -> str:
+    text = str(comment or "")
+    m = re.search(r'\b[A-Z]{2}[A-Z0-9]{10}\b', text)
+    return m.group(0) if m else ""
+
+def safe_float(x) -> float:
+    try:
+        return float(str(x).replace(',', '.'))
+    except:
+        return 0.0
+
+def detect_operation_type(op: str, inc: str, exp: str) -> str:
+    if not isinstance(op, str):
+        return "other"
+    if "Покупка" in op:
+        return "buy"
+    if "Продажа" in op:
+        return "sell"
+    if op in SPECIAL_OPERATION_HANDLERS:
+        return SPECIAL_OPERATION_HANDLERS[op](inc, exp)
+    return OPERATION_TYPE_MAP.get(op, "other")
+
+def parse_financial_operations(file_path: str) -> dict:
+    # 1) Читаем весь лист как строки
+    df = pd.read_excel(file_path, header=None, dtype=str)
+
+    # 2) Склеиваем каждую строку для удобного поиска
+    df['_row_txt'] = df.fillna('').agg(' '.join, axis=1).str.strip()
+
+    # 3) Находим и «разливаем» валюту
+    mask_cur = df['_row_txt'].isin(k for k in CURRENCY_DICT)
+    df.loc[mask_cur, '_currency'] = df.loc[mask_cur, '_row_txt'].map(
+        lambda x: CURRENCY_DICT.get(x, x)
+    )
+    df['_currency'] = df['_currency'].ffill().fillna('RUB')
+
+    # 4) Ищем индекс строки-заголовка таблицы операций
+    header_mask = (
+        df['_row_txt'].str.lower().str.contains('дата') &
+        df['_row_txt'].str.lower().str.contains('операция') &
+        df['_row_txt'].str.lower().str.contains('зачислен')
+    )
+    hdr_idxs = df.index[header_mask]
+    if hdr_idxs.empty:
+        return {"account_id": None, "account_date_start": None, "date_start": None, "date_end": None, "operations": []}
+    hdr_i = hdr_idxs[0]
+
+    # 5) Парсим header_data из строк до hdr_i
+    header_data = {
+        "account_id": None,
+        "account_date_start": None,
+        "date_start": None,
+        "date_end": None,
+        "unknown_operations": []
+    }
+    for _, raw_row in df.iloc[:hdr_i].iterrows():
+        # отбрасываем наши технические колонки
+        # и склеиваем всё обратно в единый текст
+        vals = [c for c in raw_row[:-2] if pd.notna(c)]
+        row_str = " ".join(str(c).strip() for c in vals)
+        parse_header_data(row_str, header_data)
+
+    # 6) Собираем сам блок операций
+    block = df.iloc[hdr_i:].reset_index(drop=True)
+    headers = block.iloc[0].fillna('').astype(str).str.lower()
+
+    def col(*keys):
+        for i, h in enumerate(headers):
+            if all(k in h for k in keys):
+                return i
+        return None
+
+    ci = {
+        "date":    col("дата"),
+        "op":      col("операция"),
+        "inc":     col("зачислен"),
+        "exp":     col("списани"),
+        "comment": col("примеч") or col("коммент")
+    }
+
+    data = block.iloc[1:].copy()
+    data['_txt'] = data.fillna('').agg(' '.join, axis=1).str.lower()
+    data = data[~data['_txt'].str.contains('итого')]
+
+    # 7) Проходим по строкам и собираем DTO
+    operations = []
+    for _, row in data.iterrows():
+        op_raw = str(row.iat[ci["op"]] or "").strip()
+        if not op_raw or op_raw in SKIP_OPERATIONS or op_raw not in VALID_OPERATIONS:
+            header_data["unknown_operations"].append(op_raw)
+            continue
+
+        dt = parse_date(row.iat[ci["date"]])
+        if not dt:
+            continue
+
+        inc = row.iat[ci["inc"]] or ""
+        exp = row.iat[ci["exp"]] or ""
+        payment = safe_float(inc if is_nonzero(inc) else exp)
+
+        raw_comment = row.iat[ci["comment"]]
+        comment = "" if pd.isna(raw_comment) or str(raw_comment).lower() == "nan" else str(raw_comment).strip()
+        isin = extract_isin(comment)
+
+        op_type = detect_operation_type(op_raw, inc, exp)
+        currency = row['_currency']
+
+        dto = OperationDTO(
+            date=dt,
+            operation_type=op_type,
+            payment_sum=payment,
+            currency=currency,
+            ticker="",
+            isin=isin,
+            price=0.0,
+            quantity=0,
+            aci=0.0,
+            comment=comment,
+            operation_id=""
+        )
+        operations.append(dto)
+
+    # 8) Формируем итоговый словарь
+    return {
+        "account_id": header_data.get("account_id"),
+        "account_date_start": header_data.get("account_date_start"),
+        "date_start": header_data.get("date_start"),
+        "date_end": header_data.get("date_end"),
+        "operations": [o.to_dict() for o in operations],
+    }
+
+
+
+if __name__ == "__main__":
+    file_path = "4.xls"
+    parsed = parse_financial_operations(file_path)
+    print(json.dumps(parsed, ensure_ascii=False, indent=2))
+
+```
+
+OperationDTO.py:
+```
+from datetime import datetime
+from dataclasses import dataclass, asdict, field
+from typing import Optional, Union
+
+
+@dataclass
+class OperationDTO:
+    date: Optional[Union[str, datetime]]
+    operation_type: str
+    payment_sum: Union[str, float]
+    currency: str
+    ticker: Optional[str] = ""
+    isin: Optional[str] = ""
+    price: Optional[float] = 0.0
+    quantity: Optional[int] = 0
+    aci: Optional[Union[str, float]] = 0.0
+    comment: Optional[str] = ""
+    operation_id: Optional[str] = ""
+    _sort_key: Optional[str] = field(init=False, default=None)
+
+    def __post_init__(self):
+        if self.date:
+            if isinstance(self.date, str):
+                if len(self.date) == 10:
+                    self.date += " 00:00:00"
+            self._sort_key = str(self.date)
+        else:
+            self._sort_key = ""
+
+        if isinstance(self.aci, str):
+            try:
+                self.aci = float(self.aci.replace(',', '.'))
+            except ValueError:
+                self.aci = 0.0
+
+    def to_dict(self):
+        result = asdict(self)
+        # Если date - это datetime, преобразуем его в строку для сериализации
+        if isinstance(self.date, datetime):
+            result['date'] = self.date.isoformat()
+        # Удаляем служебное поле
+        if '_sort_key' in result:
+            del result['_sort_key']
+        return result
+
+```
+
+constants.py:
+```
+from utils import is_nonzero
+
+#  Валидные операции, которые обрабатываются
+VALID_OPERATIONS = {
+    "Вознаграждение компании",
+    "Дивиденды",
+    "НДФЛ",
+    "Погашение купона",
+    "Погашение облигации",
+    "Приход ДС",
+    "Проценты по займам \"овернайт\"",
+    "Проценты по займам \"овернайт ЦБ\"",
+    "Частичное погашение облигации",
+    "Вывод ДС",
+}
+
+#  Операции, которые нужно игнорировать
+SKIP_OPERATIONS = {
+    "Внебиржевая сделка FX (22*)",
+    "Займы \"овернайт\"",
+    "НКД от операций",
+    "Покупка/Продажа",
+    "Покупка/Продажа (репо)",
+    "Переводы между площадками",
+}
+
+#  Маппинг строковых названий операций на типы
+OPERATION_TYPE_MAP = {
+    "Дивиденды": "dividend",
+    "Погашение купона": "coupon",
+    "Погашение облигации": "repayment",
+    "Приход ДС": "deposit",
+    "Частичное погашение облигации": "amortization",
+    "Вывод ДС": "withdrawal",
+}
+
+#  Обработка операций, тип которых зависит от контекста (доход/расход)
+SPECIAL_OPERATION_HANDLERS = {
+    'Проценты по займам "овернайт"': lambda i, e: "other_income" if is_nonzero(i) else "other_expense",
+    'Проценты по займам "овернайт ЦБ"': lambda i, e: "other_income" if is_nonzero(i) else "other_expense",
+    "Вознаграждение компании": lambda i, e: "commission_refund" if is_nonzero(i) else "commission",
+    "НДФЛ": lambda i, e: "refund" if is_nonzero(i) else "withholding",
+}
+
+HEADER_VARIATIONS_TRADES = {
+    "stock": {
+        "operation_id": ["номер", "Номер"],
+        "buy_quantity": ["куплено", "количеств"],
+        "buy_payment": ["сумма платежа", "платеж"],
+        "sell_quantity": ["продано", "количеств"],
+        "sell_revenue": ["сумма выручки", "выручка"],
+        "price": ["цена"],
+        "currency": ["валют"],
+        "date": ["дата соверш", "совершена"],
+        "time": ["время соверш"],
+        "comment": ["примеч", "коммент"]
+    },
+    "bond": {
+        "operation_id": ["номер", "Номер"],
+        "buy_quantity": ["куплено", "Куплено, шт"],
+        "buy_payment": ["сумма платежа", "Сумма платежа"],
+        "sell_quantity": ["продано", "Продано, шт"],
+        "sell_revenue": ["сумма выручки", "Сумма выручки"],
+        "price": ["цена", "Цена, %"],
+        "aci": ["нкд", "НКД Продажи", "НКД Покупки"],
+        "currency": ["Валюта"],
+        "date": ["дата соверш", "совершена"],
+        "time": ["время соверш"],
+        "comment": ["примеч", "коммент"]
+    },
+    "currency": {
+        "operation_id": ["номер", "Номер"],
+        "buy_price": ["курс сделки (покупка)"],
+        "buy_quantity": ["объём в валюте лота (в ед. валюты)"],
+        "buy_payment": ["объём в сопряж. валюте (в ед. валюты)"],
+        "sell_price": ["курс сделки (продажа)"],
+        "sell_quantity": ["объём в валюте лота (в ед. валюты)"],
+        "sell_payment": ["объём в сопряж. валюте (в ед. валюты)"],
+        "date": ["Дата соверш."],
+        "time": ["Время соверш"],
+        "type": ["тип сделки"],
+        "comment": ["примеч", "коммент", "Место сделки"]
+    }
+}
+
+CURRENCY_DICT = {
+    "AED": "AED", "AMD": "AMD", "BYN": "BYN", "CHF": "CHF", "CNY": "CNY",
+    "EUR": "EUR", "GBP": "GBP", "HKD": "HKD", "JPY": "JPY", "KGS": "KGS",
+    "KZT": "KZT", "NOK": "NOK", "RUB": "RUB", "РУБЛЬ": "RUB", "Рубль": "RUB",
+    "SEK": "SEK", "TJS": "TJS", "TRY": "TRY", "USD": "USD", "UZS": "UZS",
+    "XAG": "XAG", "XAU": "XAU", "ZAR": "ZAR"
+}
+
+```
+
+forex_trades.py:
+```
+import pandas as pd
+import re
+import json
+from OperationDTO import OperationDTO
+
+REQUIRED_COLUMNS = ["дата", "номер", "время", "курс сделки", "объём в валюте", "объём в сопряж"]
+
+def to_num(x):
+    try:
+        return float(str(x).replace(",", ".")) if pd.notna(x) else 0
+    except:
+        return 0
+
+def find_column_index(headers, *keywords):
+    for i, h in enumerate(headers):
+        if all(k in h for k in keywords):
+            return i
+    return None
+
+def parse_date_cell(cell):
+    try:
+        return pd.to_datetime(str(cell).strip(), format="%d.%m.%y")
+    except:
+        return pd.NaT
+
+def parse_forex_trades(file_path):
+    df = pd.read_excel(file_path, header=None)
+    results = []
+
+    # 1) начало блока
+    start_idx = None
+    for i, row in df.iterrows():
+        txt = " ".join(str(c).lower() for c in row if pd.notna(c))
+        if "иностранная валюта" in txt:
+            start_idx = i + 1
+            break
+    if start_idx is None:
+        return []
+
+    df_block = df.iloc[start_idx:].reset_index(drop=True)
+
+    # 2) строка заголовков
+    header_row = None
+    for i, row in df_block.iterrows():
+        txt = " ".join(str(c).lower() for c in row if pd.notna(c))
+        if all(key in txt for key in REQUIRED_COLUMNS):
+            header_row = i
+            break
+    if header_row is None:
+        return []
+
+    headers = df_block.iloc[header_row].astype(str).str.lower()
+
+    # 3) индексы колонок
+    col_number     = find_column_index(headers, "номер")
+    col_buy_price  = find_column_index(headers, "курс", "покупка")
+    col_sell_price = find_column_index(headers, "курс", "продажа")
+    qty_cols       = [i for i,h in enumerate(headers) if "объём в валюте" in h]
+    sum_cols       = [i for i,h in enumerate(headers) if "объём в сопряж" in h]
+    col_buy_qty, col_sell_qty = (qty_cols + [None, None])[:2]
+    col_buy_sum, col_sell_sum = (sum_cols + [None, None])[:2]
+    col_exec_date  = find_column_index(headers, "дата", "соверш")
+    col_exec_time  = find_column_index(headers, "время", "соверш")
+
+    current_ticker  = ""
+    current_currency = ""
+    i = header_row + 1
+
+    while i < len(df_block):
+        row = df_block.iloc[i]
+
+        # ► Пропускаем любые строки с "итого"
+        if row.astype(str).str.lower().str.contains("итого").any():
+            i += 1
+            continue
+
+        # ► Строка с новым тикером?
+        ticker_cell = None
+        for j, cell in enumerate(row):
+            if isinstance(cell, str) and re.fullmatch(r"[A-Z]{6,}_TOM", cell.strip()):
+                ticker_cell = (j, cell.strip())
+                break
+        if ticker_cell:
+            raw = ticker_cell[1]
+            current_ticker = raw.split("+")[0][:6]
+            info = df_block.iloc[i].astype(str)
+            idx = next((k for k,v in enumerate(info) if "сопряж. валюта:" in v.lower()), None)
+            current_currency = info.iat[idx+2].strip() if idx and idx+2 < len(info) else ""
+            i += 1
+            continue
+
+        # ► Пустая строка = конец
+        if all(pd.isna(c) or str(c).strip()=="" for c in row):
+            break
+
+        # ► Обработка операции
+        raw_date = row.iat[col_exec_date] if col_exec_date is not None else None
+        raw_time = row.iat[col_exec_time] if col_exec_time is not None else None
+
+        date_obj = parse_date_cell(raw_date)
+        time_str = str(raw_time).strip() if pd.notna(raw_time) else "00:00:00"
+
+        # поле `date_obj` гарантированно валидно (итого-строки мы уже отбросили)
+        dt = pd.to_datetime(f"{date_obj.strftime('%Y-%m-%d')} {time_str}")
+        date_str = dt.strftime("%Y-%m-%d %H:%M:%S")
+
+        number = str(row.iat[col_number]).strip() if col_number is not None else ""
+
+        bp = row.iat[col_buy_price]  if col_buy_price  is not None else None
+        sp = row.iat[col_sell_price] if col_sell_price is not None else None
+
+        if pd.notna(bp):
+            op    = "currency_buy"
+            price = to_num(bp)
+            qty   = row.iat[col_buy_qty]
+            sm    = row.iat[col_buy_sum]
+        else:
+            op    = "currency_sale"
+            price = to_num(sp)
+            qty   = row.iat[col_sell_qty]
+            sm    = row.iat[col_sell_sum]
+
+        dto = OperationDTO(
+            date=date_str,
+            operation_type=op,
+            payment_sum=to_num(sm),
+            currency=current_currency,
+            ticker=current_ticker,
+            isin="",
+            price=price,
+            quantity=to_num(qty),
+            aci=0.0,
+            comment="",
+            operation_id=number
+        )
+        results.append(dto.to_dict())
+        i += 1
+
+    return results
+
+if __name__ == "__main__":
+    trades = parse_forex_trades("pensil.XLSX")
+    print(json.dumps(trades, ensure_ascii=False, indent=2))
+
+```
+
+stocks_bounds.py:
+```
+import pandas as pd
+import re
+import json
+from datetime import datetime
+from typing import List, Any, Optional, Union
+
+from OperationDTO import OperationDTO
+
+
+def to_num(x) -> float:
+    """Преобразование значения в число с плавающей точкой."""
+    try:
+        return float(str(x).replace(",", ".")) if pd.notna(x) else 0.0
+    except Exception:
+        return 0.0
+
+
+# --- Парсинг тикера и ISIN из одной строки ---
+def parse_ticker_and_isin_row(row: List[Any]) -> tuple[str, str]:
+    """
+    Извлекает ticker и ISIN из строки над сделками, например:
+    ['RU000A10A794', 'Номер рег.:', '4B02-01-00176-L', 'ISIN:', 'RU000A10A794', ...]
+    """
+    text = " ".join(str(c).strip() for c in row if pd.notna(c))
+    match = re.search(r"^(?P<ticker>\S+).*?ISIN[:\s]*(?P<isin>[A-Z0-9]{12})", text)
+    if match:
+        return match.group("ticker"), match.group("isin")
+    return "", ""
+
+
+def is_ticker_row(row: List[Any]) -> bool:
+    return any(
+        isinstance(cell, str) and any(keyword in cell.lower() for keyword in ['номер рег', 'isin'])
+        for cell in row
+    )
+
+
+def find_block_start(df: pd.DataFrame, keyword: str) -> Optional[int]:
+    for i, row in df.iterrows():
+        if keyword in ' '.join(str(c).lower() for c in row if pd.notna(c)):
+            return i + 1
+    return None
+
+
+def find_header_row(df: pd.DataFrame, required: List[str]) -> Optional[int]:
+    for i, row in df.iterrows():
+        cells = [str(c).lower() for c in row if pd.notna(c)]
+        if all(any(req in cell for cell in cells) for req in required):
+            return i
+    return None
+
+
+def find_column_index(headers: List[str], *keywords: str) -> Optional[int]:
+    for i, h in enumerate(headers):
+        if all(k in h for k in keywords):
+            return i
+    return None
+
+
+def parse_stock_section(block: pd.DataFrame) -> List[dict]:
+    results: List[dict] = []
+    required = ['дата', 'номер', 'куплено', 'продано', 'сумма', 'валюта', 'дата соверш', 'время соверш']
+    hdr_idx = find_header_row(block, required)
+    if hdr_idx is None:
+        return results
+    headers = block.iloc[hdr_idx].astype(str).str.lower().tolist()
+
+    idx = {
+        'num':     find_column_index(headers, 'номер'),
+        'buy_qty': find_column_index(headers, 'куплено'),
+        'sell_qty':find_column_index(headers, 'продано'),
+        'buy_sum': find_column_index(headers, 'сумма', 'платеж'),
+        'sell_sum':find_column_index(headers, 'сумма', 'выруч'),
+        'currency':find_column_index(headers, 'валюта'),
+        'date':    find_column_index(headers, 'дата соверш'),
+        'time':    find_column_index(headers, 'время соверш'),
+    }
+    price_cols = [i for i, h in enumerate(headers) if 'цена' in h]
+    idx['buy_pr'], idx['sell_pr'] = (price_cols + [None, None])[:2]
+
+    curr_ticker, curr_isin = '', ''
+    for row in block.iloc[hdr_idx+1:].itertuples(index=False):
+        cells = list(row)
+        if all(pd.isna(c) or (isinstance(c, str) and not c.strip()) for c in cells):
+            break
+        if any(isinstance(c, str) and c.lower().startswith('итого') for c in cells):
+            continue
+        if is_ticker_row(cells):
+            curr_ticker, curr_isin = parse_ticker_and_isin_row(cells)
+            continue
+        dt = pd.to_datetime(
+            f"{cells[idx['date']]} {cells[idx['time']]}", dayfirst=True, errors='coerce'
+        )
+        if pd.isna(dt):
+            continue
+
+        buy = to_num(cells[idx['buy_qty']])
+        sell = to_num(cells[idx['sell_qty']])
+        if buy > 0:
+            op, qty, pr, total, aci = 'buy', buy, to_num(cells[idx['buy_pr']]), to_num(cells[idx['buy_sum']]), 0.0
+        elif sell > 0:
+            op, qty, pr, total, aci = 'sell', sell, to_num(cells[idx['sell_pr']]), to_num(cells[idx['sell_sum']]), 0.0
+        else:
+            continue
+
+        results.append(
+            OperationDTO(
+                date=dt.strftime('%Y-%m-%d %H:%M:%S'),
+                operation_type=op,
+                payment_sum=total,
+                currency=str(cells[idx['currency']]).strip(),
+                ticker=curr_ticker,
+                isin=curr_isin,
+                price=pr,
+                quantity=int(qty),
+                aci=aci,
+                comment='',
+                operation_id=str(cells[idx['num']]).strip()
+            ).to_dict()
+        )
+    return results
+
+
+def parse_bond_section(block: pd.DataFrame) -> List[dict]:
+    results: List[dict] = []
+    required = ['совершена', 'номер', 'куплено', 'продано', 'сумма', 'валюта', 'нкд покупки', 'нкд продажи']
+    hdr_idx = find_header_row(block, required)
+    if hdr_idx is None:
+        return results
+    headers = block.iloc[hdr_idx].astype(str).str.lower().tolist()
+
+    idx = {
+        'num':     find_column_index(headers, 'номер'),
+        'buy_qty': find_column_index(headers, 'куплено'),
+        'sell_qty':find_column_index(headers, 'продано'),
+        'buy_sum': find_column_index(headers, 'сумма', 'платеж'),
+        'sell_sum':find_column_index(headers, 'сумма', 'выруч'),
+        'currency':find_column_index(headers, 'валюта'),
+        'date':    find_column_index(headers, 'совершена'),
+        'aci_buy': find_column_index(headers, 'нкд', 'покупки'),
+        'aci_sell':find_column_index(headers, 'нкд', 'продажи'),
+    }
+    price_cols = [i for i, h in enumerate(headers) if 'цена' in h]
+    idx['buy_pr'], idx['sell_pr'] = (price_cols + [None, None])[:2]
+
+    curr_ticker, curr_isin = '', ''
+    for row in block.iloc[hdr_idx+1:].itertuples(index=False):
+        cells = list(row)
+        if all(pd.isna(c) or (isinstance(c, str) and not c.strip()) for c in cells):
+            break
+        if any(isinstance(c, str) and c.lower().startswith('итого') for c in cells):
+            continue
+        if is_ticker_row(cells):
+            curr_ticker, curr_isin = parse_ticker_and_isin_row(cells)
+            continue
+        dt = pd.to_datetime(f"{cells[idx['date']]} 00:00:00", dayfirst=True, errors='coerce')
+        if pd.isna(dt):
+            continue
+        buy = to_num(cells[idx['buy_qty']])
+        sell = to_num(cells[idx['sell_qty']])
+        if buy > 0:
+            op, qty, pr, total, aci = 'buy', buy, to_num(cells[idx['buy_pr']]), to_num(cells[idx['buy_sum']]), to_num(cells[idx['aci_buy']])
+        elif sell > 0:
+            op, qty, pr, total, aci = 'sell', sell, to_num(cells[idx['sell_pr']]), to_num(cells[idx['sell_sum']]), to_num(cells[idx['aci_sell']])
+        else:
+            continue
+        results.append(
+            OperationDTO(
+                date=dt.strftime('%Y-%m-%d %H:%M:%S'),
+                operation_type=op,
+                payment_sum=total,
+                currency=str(cells[idx['currency']]).strip(),
+                ticker=curr_ticker,
+                isin=curr_isin,
+                price=pr,
+                quantity=int(qty),
+                aci=aci,
+                comment='',
+                operation_id=str(cells[idx['num']]).strip()
+            ).to_dict()
+        )
+    return results
+
+
+def parse_stock_bond_trades(file_path: Union[str, Any]) -> List[dict]:
+    df = pd.read_excel(file_path, header=None)
+    start_idx = find_block_start(df, '2.1. сделки')
+    if start_idx is None:
+        return []
+    block = df.iloc[start_idx:].reset_index(drop=True)
+
+    section_indices, section_types = [], []
+    for i, row in block.iterrows():
+        text = ' '.join(str(c).lower() for c in row if pd.notna(c))
+        if 'акция' in text or 'адр' in text:
+            section_indices.append(i)
+            section_types.append('stock')
+        elif 'облигация' in text:
+            section_indices.append(i)
+            section_types.append('bond')
+    section_indices.append(len(block))
+
+    all_results: List[dict] = []
+    for (s, e), t in zip(zip(section_indices, section_indices[1:]), section_types):
+        sect = block.iloc[s+1:e].reset_index(drop=True)
+        if t == 'stock':
+            all_results.extend(parse_stock_section(sect))
+        else:
+            all_results.extend(parse_bond_section(sect))
+
+    return sorted(all_results, key=lambda x: x['date'])
+
+
+if __name__ == '__main__':
+    trades = parse_stock_bond_trades('2.XLS')
+    print(json.dumps(trades, ensure_ascii=False, indent=2))
+
+```
+
+utils.py:
+```
+from typing import Any, Optional, Dict
+from datetime import datetime
+
+import xlrd
+
+import re
+
+
+def parse_header_data(row_str: str, header_data: dict) -> None:
+    """
+    Извлекает из строки:
+      - account_id       по шаблону "Генеральное соглашение: <число>"
+      - account_date_start  по шаблону "от DD.MM.YYYY"
+      - date_start, date_end по шаблону "Период: с DD.MM.YYYY по DD.MM.YYYY"
+    """
+    # Генеральное соглашение
+    if "Генеральное соглашение:" in row_str:
+        m = re.search(r"Генеральное соглашение:\s*(\d+)", row_str)
+        if m:
+            header_data["account_id"] = m.group(1)
+        dm = re.search(r"от\s+(\d{2}\.\d{2}\.\d{4})", row_str)
+        if dm:
+            header_data["account_date_start"] = parse_date(dm.group(1))
+
+    # Период
+    elif "Период:" in row_str and "по" in row_str:
+        # ожидаем вид: "Период:    с 01.07.2023 по 31.07.2023"
+        parts = row_str.split()
+        try:
+            i_s = parts.index("с")
+            i_p = parts.index("по")
+            header_data["date_start"] = parse_date(parts[i_s + 1])
+            header_data["date_end"]   = parse_date(parts[i_p + 1])
+        except (ValueError, IndexError):
+            pass
+
+def is_nonzero(value: Any) -> bool:
+    """
+    Проверка на значение, отличное от нуля.
+    """
+    try:
+        return float(str(value).replace(",", ".").replace(" ", "")) != 0
+    except (ValueError, TypeError):
+        return False
+
+
+def parse_date(value: Any) -> Optional[str]:
+    """
+    Универсальный парсер даты.
+    Поддерживает:
+    - datetime.datetime
+    - Excel float/int дату (как в .xls)
+    - Строки в формате 'дд.мм.гггг' или 'дд.мм.гг'
+    Возвращает строку в формате 'YYYY-MM-DD' или None.
+    """
+    if not value:
+        return None
+
+    if isinstance(value, datetime):
+        return value.strftime("%Y-%m-%d")
+
+    if isinstance(value, (int, float)):
+        try:
+            date = datetime(*xlrd.xldate_as_tuple(value, 0))
+            return date.strftime("%Y-%m-%d")
+        except Exception:
+            return None
+
+    if isinstance(value, str):
+        value = value.strip()
+        for fmt in ("%d.%m.%Y", "%d.%m.%y"):
+            try:
+                return datetime.strptime(value, fmt).strftime("%Y-%m-%d")
+            except ValueError:
+                continue
+
+    return None
+
+
+```
+
+main.py:
+```
+from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi.responses import JSONResponse
+import uvicorn
+import shutil
+import os
+import tempfile
+
+from full_statement import parse_full_statement
+
+app = FastAPI(
+    title="Financial Statement Parser API",
+    description="API for parsing financial statements including cash operations, forex trades, and stock/bond trades.",
+    version="1.0.0"
+)
+
+@app.post("/parse-statement")
+async def parse_statement(file: UploadFile = File(...)):
+    """
+    Upload an Excel file (.xls or .xlsx) of a brokerage statement.
+    Returns a JSON with account metadata and a unified list of operations.
+    """
+    # Validate file extension
+    filename = file.filename
+    if not filename.lower().endswith(('.xls', '.xlsx')):
+        raise HTTPException(status_code=400, detail="Unsupported file type. Please upload .xls or .xlsx")
+
+    # Save uploaded file to a temporary location
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(filename)[1]) as tmp:
+            shutil.copyfileobj(file.file, tmp)
+            tmp_path = tmp.name
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to save uploaded file: {e}")
+    finally:
+        file.file.close()
+
+    # Parse the statement
+    try:
+        result = parse_full_statement(tmp_path)
+    except Exception as e:
+        # Clean up temp file
+        os.remove(tmp_path)
+        raise HTTPException(status_code=500, detail=f"Error parsing statement: {e}")
+
+    # Clean up temp file
+    os.remove(tmp_path)
+
+    return JSONResponse(content=result)
+
+
+
+```
