@@ -2,20 +2,10 @@ import pandas as pd
 import re
 import json
 from OperationDTO import OperationDTO
+from utils import to_num, find_column_index
 
 REQUIRED_COLUMNS = ["дата", "номер", "время", "курс сделки", "объём в валюте", "объём в сопряж"]
 
-def to_num(x):
-    try:
-        return float(str(x).replace(",", ".")) if pd.notna(x) else 0
-    except:
-        return 0
-
-def find_column_index(headers, *keywords):
-    for i, h in enumerate(headers):
-        if all(k in h for k in keywords):
-            return i
-    return None
 
 def parse_date_cell(cell):
     try:

@@ -5,21 +5,13 @@ from datetime import datetime
 from typing import List, Any, Optional, Union
 
 from OperationDTO import OperationDTO
-
-
-def to_num(x) -> float:
-    """Преобразование значения в число с плавающей точкой."""
-    try:
-        return float(str(x).replace(",", ".")) if pd.notna(x) else 0.0
-    except Exception:
-        return 0.0
+from utils import to_num, find_column_index
 
 
 # --- Парсинг тикера и ISIN из одной строки ---
 def parse_ticker_and_isin_row(row: List[Any]) -> tuple[str, str]:
     """
     Извлекает ticker и ISIN из строки над сделками, например:
-    ['RU000A10A794', 'Номер рег.:', '4B02-01-00176-L', 'ISIN:', 'RU000A10A794', ...]
     """
     text = " ".join(str(c).strip() for c in row if pd.notna(c))
     match = re.search(r"^(?P<ticker>\S+).*?ISIN[:\s]*(?P<isin>[A-Z0-9]{12})", text)
@@ -49,12 +41,6 @@ def find_header_row(df: pd.DataFrame, required: List[str]) -> Optional[int]:
             return i
     return None
 
-
-def find_column_index(headers: List[str], *keywords: str) -> Optional[int]:
-    for i, h in enumerate(headers):
-        if all(k in h for k in keywords):
-            return i
-    return None
 
 
 def parse_stock_section(block: pd.DataFrame) -> List[dict]:
@@ -211,6 +197,4 @@ def parse_stock_bond_trades(file_path: Union[str, Any]) -> List[dict]:
     return sorted(all_results, key=lambda x: x['date'])
 
 
-if __name__ == '__main__':
-    trades = parse_stock_bond_trades('2.XLS')
-    print(json.dumps(trades, ensure_ascii=False, indent=2))
+

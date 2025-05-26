@@ -1,4 +1,4 @@
-from utils import is_nonzero
+from typing import Any
 
 #  Валидные операции, которые обрабатываются
 VALID_OPERATIONS = {
@@ -90,3 +90,13 @@ CURRENCY_DICT = {
     "SEK": "SEK", "TJS": "TJS", "TRY": "TRY", "USD": "USD", "UZS": "UZS",
     "XAG": "XAG", "XAU": "XAU", "ZAR": "ZAR"
 }
+
+
+def is_nonzero(value: Any) -> bool:
+    """
+    Проверка на значение, отличное от нуля.
+    """
+    try:
+        return float(str(value).replace(",", ".").replace(" ", "")) != 0
+    except (ValueError, TypeError):
+        return False

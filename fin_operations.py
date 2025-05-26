@@ -5,34 +5,11 @@ import re
 from OperationDTO import OperationDTO
 from constants import (
     CURRENCY_DICT,
-    OPERATION_TYPE_MAP,
     SKIP_OPERATIONS,
-    SPECIAL_OPERATION_HANDLERS,
-    VALID_OPERATIONS,
+    VALID_OPERATIONS, is_nonzero,
 )
-from utils import parse_date, parse_header_data, is_nonzero
+from utils import parse_date, parse_header_data, to_num, extract_isin, detect_operation_type
 
-def extract_isin(comment) -> str:
-    text = str(comment or "")
-    m = re.search(r'\b[A-Z]{2}[A-Z0-9]{10}\b', text)
-    return m.group(0) if m else ""
-
-def safe_float(x) -> float:
-    try:
-        return float(str(x).replace(',', '.'))
-    except:
-        return 0.0
-
-def detect_operation_type(op: str, inc: str, exp: str) -> str:
-    if not isinstance(op, str):
-        return "other"
-    if "Покупка" in op:
-        return "buy"
-    if "Продажа" in op:
-        return "sell"
-    if op in SPECIAL_OPERATION_HANDLERS:
-        return SPECIAL_OPERATION_HANDLERS[op](inc, exp)
-    return OPERATION_TYPE_MAP.get(op, "other")
 
 def parse_financial_operations(file_path: str) -> dict:
     # 1) Читаем весь лист как строки
@@ -110,7 +87,7 @@ def parse_financial_operations(file_path: str) -> dict:
 
         inc = row.iat[ci["inc"]] or ""
         exp = row.iat[ci["exp"]] or ""
-        payment = safe_float(inc if is_nonzero(inc) else exp)
+        payment = to_num(inc if is_nonzero(inc) else exp)
 
         raw_comment = row.iat[ci["comment"]]
         comment = "" if pd.isna(raw_comment) or str(raw_comment).lower() == "nan" else str(raw_comment).strip()
